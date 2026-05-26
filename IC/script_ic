@@ -1,0 +1,961 @@
+# 0) Pacotes e configuração
+#    (mantido sem alterações de procedimento; apenas removidas
+#     chamadas repetidas e comentários explicativos adicionados)
+library(readxl)
+library(tidyverse)
+library(janitor)
+library(tidytext)
+library(stringi)   # stri_trans_general: remoção de acentos
+library(stopwords)
+library(gt)        # formatação/exportação de tabelas (PNG)
+library(widyr)
+# OBS: pairwise_count() é da {widyr}. Se necessário, carregar: library(widyr)
+
+# 1) Leitura e padronização da base
+# Faça o download da tabela no Dataverse da Unicamp: [DOI aqui]
+# Salve o arquivo .xlsx na mesma pasta deste script
+# Verifique o diretório de trabalho com: getwd()
+# Para alterar: setwd("caminho/para/a/pasta")
+
+base_de_dados <- read_xlsx("dissertacoes_ppgs_unicamp.xlsx")
+
+base_de_dados <- clean_names(base_de_dados) %>%
+  mutate(
+    periodo = case_when(
+      ano_de_defesa >= 1974 & ano_de_defesa <= 1983 ~ "1974–1983",
+      ano_de_defesa >= 1984 & ano_de_defesa <= 1993 ~ "1984–1993",
+      ano_de_defesa >= 1994 & ano_de_defesa <= 2003 ~ "1994–2003",
+      ano_de_defesa >= 2004 & ano_de_defesa <= 2013 ~ "2004–2013",
+      ano_de_defesa >= 2014 & ano_de_defesa <= 2024 ~ "2014–2024",
+      TRUE ~ NA_character_
+    )
+  )
+
+# 1.1) Base anual COMPLETA (1974–2024) + percentuais GLOBAIS
+# Requer: base_de_dados carregada (Bloco 1), e pacotes tidyverse/gt/scales
+base_ano <- base_de_dados %>%
+  mutate(ano_de_defesa = as.integer(ano_de_defesa)) %>%
+  count(ano_de_defesa, name = "n") %>%
+  complete(ano_de_defesa = 1974:2024, fill = list(n = 0)) %>%
+  arrange(ano_de_defesa)
+
+total_corpus <- sum(base_ano$n)
+
+base_ano <- base_ano %>%
+  mutate(
+    freq_pct_global      = 100 * n / total_corpus,
+    freq_pct_acum_global = 100 * cumsum(n) / total_corpus
+  )
+
+# 1.2) Função: tabela gt para um intervalo (percentuais GLOBAIS)
+gt_tabela_periodo_global <- function(df_global, inicio, fim,
+                                     titulo = NULL,
+                                     incluir_zeros = TRUE) {
+  
+  df_periodo <- df_global %>%
+    filter(ano_de_defesa >= inicio, ano_de_defesa <= fim) %>%
+    { if (!incluir_zeros) filter(., n > 0) else . } %>%
+    transmute(
+      Ano                                 = as.character(ano_de_defesa),
+      `Número de dissertações`            = n,
+      `Frequência relativa (%)`           = round(freq_pct_global, 1),
+      `Frequência relativa acumulada (%)` = round(freq_pct_acum_global, 1)
+    )
+  
+  total_periodo_n   <- sum(df_periodo$`Número de dissertações`)
+  total_periodo_pct <- round(100 * total_periodo_n / total_corpus, 1)
+  acum_no_fim       <- dplyr::last(df_periodo$`Frequência relativa acumulada (%)`)
+  
+  total_row <- tibble(
+    Ano                                 = "TOTAL",
+    `Número de dissertações`            = total_periodo_n,
+    `Frequência relativa (%)`           = total_periodo_pct,
+    `Frequência relativa acumulada (%)` = acum_no_fim
+  )
+  
+  bind_rows(df_periodo, total_row) %>%
+    gt() %>%
+    cols_align("center", everything()) %>%
+    fmt_number(columns = `Número de dissertações`, decimals = 0, use_seps = TRUE) %>%
+    fmt_number(columns = c(`Frequência relativa (%)`, `Frequência relativa acumulada (%)`),
+               decimals = 1, use_seps = TRUE) %>%
+    tab_style(style = cell_text(weight = "bold"),
+              locations = cells_body(rows = Ano == "TOTAL")) %>%
+    opt_stylize(style = 6, color = "gray") %>%
+    opt_row_striping() %>%
+    opt_table_outline() %>%
+    tab_options(table.align = "left")
+}
+
+# 1.3) Exemplos de uso (descomente gtsave se quiser PNG)
+tabela_1974_1983 <- gt_tabela_periodo_global(base_ano, 1974, 1983)
+tabela_1974_1983
+# gtsave(tabela_1974_1983, filename = "diss_decada1.png")
+
+tabela_1984_1993 <- gt_tabela_periodo_global(base_ano, 1984, 1993)
+tabela_1984_1993
+# gtsave(tabela_1984_1993, filename = "diss_decada2.png")
+
+tabela_1994_2003 <- gt_tabela_periodo_global(base_ano, 1994, 2003)
+tabela_1994_2003
+# gtsave(tabela_1994_2003, filename = "diss_decada3.png")
+
+tabela_2004_2013 <- gt_tabela_periodo_global(base_ano, 2004, 2013)
+tabela_2004_2013
+# gtsave(tabela_2004_2013, filename = "diss_decada4.png")
+
+tabela_2014_2024 <- gt_tabela_periodo_global(base_ano, 2014, 2024)
+tabela_2014_2024
+# gtsave(tabela_2014_2024, filename = "diss_decada5.png")
+
+# 2) Configuração de stopwords (pt) + lista customizada
+stop_custom <- c(
+  stopwords("pt", source = "snowball"),
+  "sobre", "estudo", "caso", "analise", "anos",
+  "pesquisa", "nao", "partir", "processo", "dissertacao",
+  "tambem", "objetivo", "sao", "paulo", "sp", "rio",
+  "brasil", "brasileira", "campinas", "ensaio", "paulista", "contribuicao", 
+  "debate", "condicoes", "sul", "grande", "local", "aspectos", "assim", "presente",
+  "desta", "quais", "sentido", "neste", "nesse", "compreender", "analisar", "atraves",
+  "principais", "parte", "periodo", "questao", "diferentes", "fim", "tal", "alem", "tanto",
+  "ter", "contexto", "ano", "novo", "realizar", "principal", "fazer", "obra", "apresentar", 
+  "procurar"
+)
+
+# 3) Tokenização dos títulos (unigramas)
+titulos_tokens <- base_de_dados %>%
+  select(id, titulo, ano_de_defesa, periodo) %>%
+  filter(!is.na(titulo)) %>%
+  mutate(
+    titulo = str_to_lower(titulo),
+    titulo = stri_trans_general(titulo, "Latin-ASCII")
+  ) %>%
+  unnest_tokens(palavra, titulo) %>%
+  filter(
+    !palavra %in% stop_custom,
+    !str_detect(palavra, "^[0-9]+$"),
+    nchar(palavra) > 1
+  )
+
+# 4) Frequências de unigramas e tabela (Top 30)
+total_tokens <- nrow(titulos_tokens)
+
+tabela_unigramas <- titulos_tokens %>%
+  count(palavra, sort = TRUE, name = "n") %>%
+  mutate(
+    rank = row_number(),
+    freq_rel = n / total_tokens,
+    termo = str_to_title(palavra)
+  ) %>%
+  select(rank, termo, n, freq_rel)
+
+gt_unigramas <- tabela_unigramas %>%
+  slice_head(n = 30) %>%
+  gt() %>%
+  fmt_percent(columns = freq_rel, decimals = 2) %>%
+  cols_label(
+    rank = "Posição",
+    termo = "Unigrama",
+    n = "Frequência",
+    freq_rel = "Frequência relativa"
+  ) %>%
+  opt_stylize(style = 6, color = "gray") %>%
+  opt_table_outline() %>%
+  tab_options(
+    table.align = "left",
+    table.width = px(600)
+  )
+
+# 5) Bigramas: geração, limpeza e frequência
+bigrams <- base_de_dados %>%
+  select(titulo, ano_de_defesa) %>%
+  filter(!is.na(titulo)) %>%
+  mutate(
+    titulo = str_to_lower(titulo),
+    titulo = stri_trans_general(titulo, "Latin-ASCII")
+  ) %>%
+  unnest_tokens(bigrama, titulo, token = "ngrams", n = 2)
+
+bigrams_limpos <- bigrams %>%
+  tidyr::separate(bigrama, c("p1", "p2"), sep = " ") %>%
+  filter(
+    !p1 %in% stop_custom, !p2 %in% stop_custom,
+    !is.na(p1), !is.na(p2),
+    nchar(p1) > 1, nchar(p2) > 1,
+    !str_detect(p1, "^[0-9]+$"),
+    !str_detect(p2, "^[0-9]+$")
+  ) %>%
+  tidyr::unite("bigrama", p1, p2, sep = " ")
+
+bigrams_freq <- bigrams_limpos %>%
+  count(bigrama, sort = TRUE, name = "n")
+
+total_bigrams <- sum(bigrams_freq$n)
+
+tabela_bigrams_bruta <- bigrams_freq %>%
+  mutate(
+    rank = row_number(),
+    freq_rel = n / total_bigrams,
+    bigrama = str_to_title(bigrama)
+  ) %>%
+  select(rank, bigrama, n, freq_rel)
+
+gt_bigrams_bruta <- tabela_bigrams_bruta %>%
+  slice_head(n = 30) %>%
+  gt() %>%
+  fmt_percent(columns = freq_rel, decimals = 2) %>%
+  cols_label(
+    rank = "Posição",
+    bigrama = "Bigrama",
+    n = "Frequência",
+    freq_rel = "Frequência relativa"
+  ) %>%
+  opt_stylize(style = 6, color = "gray") %>%
+  opt_table_outline() %>%
+  tab_options(
+    table.align = "left",
+    table.width = px(600)
+  )
+
+# 6) Exportação das tabelas (PNG em alta resolução)
+#    (removidas chamadas duplicadas de gtsave)
+# gtsave(gt_unigramas, "unigramas_top30.png", vwidth = 900, vheight = 1200, zoom = 2)
+# gtsave(gt_bigrams_bruta, "bigrams_top30.png",  vwidth = 900, vheight = 1200, zoom = 2)
+
+# 7) Aproximação de ID de título para coocorrência
+#    (mantido conforme seu procedimento original)
+titulos_tokens <- titulos_tokens %>%
+  mutate(titulo_id = row_number() %/% 14)  # ≈ 14 tokens por título (aproximação para agrupamento)
+
+# 8) Coocorrência de palavras por título (arestas p/ Gephi)
+edges_raw <- pairwise_count(
+  tbl     = titulos_tokens %>% distinct(titulo_id, palavra),
+  item    = palavra,
+  feature = titulo_id,
+  sort    = TRUE,
+  upper   = FALSE
+)
+
+MIN_WEIGHT <- 2
+
+edges_gephi <- edges_raw %>%
+  filter(n >= MIN_WEIGHT) %>%
+  transmute(Source = item1, Target = item2, Weight = n) %>%
+  filter(!is.na(Source), !is.na(Target))
+
+# 9) Nós (palavras) + métricas básicas e grafo
+nodes_freq <- titulos_tokens %>%
+  count(palavra, name = "Freq")
+
+vertices <- tibble(name = unique(c(edges_gephi$Source, edges_gephi$Target))) %>%
+  mutate(name = as.character(name))
+
+nodes_tbl <- vertices %>%
+  left_join(nodes_freq, by = c("name" = "palavra")) %>%
+  mutate(Freq = coalesce(Freq, 0L))
+
+g <- igraph::graph_from_data_frame(
+  d = edges_gephi %>% rename(from = Source, to = Target),
+  directed = FALSE,
+  vertices = nodes_tbl
+)
+
+nodes_gephi <- nodes_tbl %>%
+  transmute(
+    Id = name,
+    Label = stringr::str_to_title(name),
+    Freq = Freq,
+    degree = igraph::degree(g),
+    strength = igraph::strength(g, weights = igraph::E(g)$Weight)
+  )
+
+# 10) Exportação para Gephi (CSV)
+# readr::write_csv(nodes_gephi, "nodes_titulos_cooc.csv")
+# readr::write_csv(edges_gephi, "edges_titulos_cooc.csv")
+
+# 11) Palavras-chave: preparação do objeto de análise
+#     - Seleciona variáveis de interesse
+#     - Expande palavras-chave separadas por ";"
+#     - Remove "sociologia" isolada por ser pouco explicativa
+# (pacotes já carregados antes: tidyverse, stringr, gt)
+
+base_palavras <- base_de_dados %>%
+  select(id, palavras_chave, periodo, ano_de_defesa) %>% 
+  filter(!is.na(palavras_chave)) %>%
+  mutate(palavras_chave = str_squish(palavras_chave)) %>%
+  separate_rows(palavras_chave, sep = ";") %>%
+  mutate(palavras_chave = str_trim(palavras_chave)) %>% 
+  filter(!(tolower(palavras_chave) == "sociologia"))
+
+# 12) Frequência geral de palavras-chave e Top 30
+#     (com freq. relativa e freq. acumulada)
+frequencia_palavras <- base_palavras %>%
+  group_by(palavras_chave) %>%
+  summarise(n = n(), .groups = "drop") %>%
+  arrange(desc(n), palavras_chave)
+
+# Top 30 com freq. relativa (sobre TODAS as palavras) e freq. acumulada
+top30_palavras <- frequencia_palavras %>%
+  mutate(
+    freq_rel  = n / sum(n),          # frequência relativa (0–1)
+    freq_acum = cumsum(freq_rel),    # frequência acumulada (0–1)
+    rank      = row_number()
+  ) %>%
+  select(
+    rank,
+    palavras_chave,
+    n,
+    freq_rel,
+    freq_acum
+  ) %>%
+  slice_head(n = 30)
+
+# Linha de TOTAL (somatório do top 30)
+linha_total_palavras <- top30_palavras %>%
+  summarise(
+    rank          = "Total",
+    palavras_chave = "",
+    n             = sum(n),
+    freq_rel      = sum(freq_rel),
+    freq_acum     = max(freq_acum)
+  )
+
+# Junta dados + linha total
+top30_display_palavras <- top30_palavras %>%
+  mutate(rank = as.character(rank)) %>%
+  bind_rows(linha_total_palavras)
+
+# Tabela gt
+gt_top30_palavras <- top30_display_palavras %>%
+  gt() %>%
+  cols_label(
+    rank          = "Posição",
+    palavras_chave = "Palavra-chave",
+    n             = "Frequência",
+    freq_rel      = "Frequência relativa",
+    freq_acum     = "Frequência acumulada"
+  ) %>%
+  opt_stylize(style = 6, color = "gray") %>%
+  opt_table_outline() %>%
+  tab_options(
+    table.align = "left",
+    table.width = px(900),
+    table.font.size = px(18),
+    data_row.padding = px(6)
+  ) %>%
+  cols_width(
+    rank          ~ px(80),
+    palavras_chave ~ px(320),
+    n             ~ px(160),
+    freq_rel      ~ px(160),
+    freq_acum     ~ px(180)
+  ) %>%
+  cols_align(align = "left",   columns = palavras_chave) %>%
+  cols_align(align = "center", columns = c(rank, n, freq_rel, freq_acum)) %>%
+  fmt_number(
+    columns = n,
+    decimals = 0,
+    sep_mark = ".",
+    dec_mark = ","
+  ) %>%
+  fmt_percent(
+    columns = c(freq_rel, freq_acum),
+    decimals = 2,
+    sep_mark = ".",
+    dec_mark = ","
+  ) %>%
+  # destaca a linha "Total"
+  tab_style(
+    style = list(
+      cell_fill(color = "grey85"),
+      cell_text(weight = "bold")
+    ),
+    locations = cells_body(
+      rows = rank == "Total"
+    )
+  )
+
+gt_top30_palavras
+
+#gtsave(gt_top30_palavras, "top30_palavras_chave.png", vwidth = 950, vheight = 1100, zoom = 2)
+
+# 13) Palavras-chave por período: Top 5 (com empates)
+palavras_decada <- base_palavras %>%
+  count(periodo, palavras_chave, name = "frequencia") %>%
+  group_by(periodo) %>%
+  arrange(periodo, desc(frequencia), palavras_chave) %>%
+  ungroup()
+
+tab_palavras <- palavras_decada %>%
+  slice_max(order_by = frequencia, n = 5, with_ties = TRUE) %>%
+  mutate(item = sprintf("%s (%d)", palavras_chave, frequencia)) %>%
+  group_by(periodo) %>%
+  summarise(`Palavras-chave (freq.)` = str_c(item, collapse = "; "),
+            .groups = "drop") %>%
+  arrange(periodo) %>%
+  rename(`Período` = periodo)
+
+gt_palavras_decadas <- tab_palavras %>%  # <- corrige objeto inexistente
+  gt() %>%
+  opt_stylize(style = 6, color = "gray") %>%
+  tab_options(table.align = "left") %>% 
+  cols_align("left", columns = everything()) %>%
+  cols_width(
+    `Período` ~ px(140),
+    `Palavras-chave (freq.)` ~ px(800)
+  )
+
+gt_palavras_decadas
+# gtsave(gt_palavras_decadas, filename = "palavras_decada.png")
+
+# 14) Versão filtrada: mantém todas as palavras da 1ª década
+#     e, nas demais, filtra frequência > 1
+palavras_decada_filtrada <- palavras_decada %>% 
+  filter(frequencia > 1 | periodo == "1974–1983")
+
+tab_plv_dec_filtr <- palavras_decada_filtrada %>%
+  mutate(item = sprintf("%s (%d)", palavras_chave, frequencia)) %>%
+  group_by(periodo) %>%
+  summarise(`Palavras-chave (freq.)` = str_c(item, collapse = "; "),
+            .groups = "drop") %>%
+  arrange(periodo) %>%
+  rename(`Período` = periodo)
+
+gt_plv_dcd_flt <- tab_plv_dec_filtr %>%
+  gt() %>%
+  opt_stylize(style = 6, color = "gray") %>%
+  tab_options(table.align = "left") %>% 
+  cols_align("left", columns = everything()) %>%
+  cols_width(
+    `Período` ~ px(140),
+    `Palavras-chave (freq.)` ~ px(800)
+  ) %>% 
+  tab_options(
+    table.align = "left",
+    table.width = px(900),
+    table.font.size = px(18),
+    data_row.padding = px(6)
+  )
+
+gt_plv_dcd_flt
+ #gtsave(gt_plv_dcd_flt, filename = "palavras_decada_flt.png")
+
+# 15) Rede de coocorrência por período (SEM widyr)
+#     - constrói arestas por doc/periodo (pares não direcionais)
+#     - constrói nós por periodo com freq e nº de docs
+# Base sem duplicar a mesma palavra por doc/periodo
+base_palavras_nodup <- base_palavras %>%
+  distinct(periodo, id, palavras_chave)
+
+# ARESTAS por período
+edges_periodo <- base_palavras_nodup %>%
+  group_by(periodo, id) %>%
+  summarise(palavras = list(palavras_chave), .groups = "drop") %>%
+  mutate(
+    pares = purrr::map(palavras, ~ {
+      v <- sort(unique(.x))
+      if (length(v) > 1) combn(v, 2, simplify = FALSE) else NULL
+    })
+  ) %>%
+  select(-palavras) %>%
+  unnest(pares) %>%
+  mutate(
+    source = purrr::map_chr(pares, 1),
+    target = purrr::map_chr(pares, 2)
+  ) %>%
+  count(periodo, source, target, name = "weight")
+
+# NÓS por período
+nodes_periodo <- base_palavras %>%
+  group_by(periodo, palavras_chave) %>%
+  summarise(freq = n(), n_docs = n_distinct(id), .groups = "drop") %>%
+  transmute(
+    periodo,
+    id    = palavras_chave,   # id = a própria palavra
+    label = palavras_chave,   # label para exibição
+    freq,
+    n_docs
+  )
+
+# 16) Exportação Gephi por período (CSV + consolidados)
+dir.create("gephi_export", showWarnings = FALSE)
+uniq_periodos <- nodes_periodo %>% distinct(periodo) %>% pull(periodo)
+
+for (p in uniq_periodos) {
+  readr::write_csv(
+    nodes_periodo %>% filter(periodo == p) %>% select(-periodo),
+    file = file.path("gephi_export", paste0("nodes_", p, ".csv"))
+  )
+  readr::write_csv(
+    edges_periodo %>% filter(periodo == p) %>% select(-periodo),
+    file = file.path("gephi_export", paste0("edges_", p, ".csv"))
+  )
+}
+
+# readr::write_csv(nodes_periodo, file.path("gephi_export", "nodes_todos_periodos.csv"))
+# readr::write_csv(edges_periodo, file.path("gephi_export", "edges_todos_periodos.csv"))
+
+# 17) Redes CUMULATIVAS por cortes (1974–1983, …, 1974–2024)
+#     - monta "periodos acumulados" usando o ano de publicação
+#     - reconta nós/arestas com acúmulo
+# Tabela de cortes
+cutoffs <- tibble(fim = c(1983, 1993, 2003, 2013, 2024)) %>%
+  mutate(periodo = paste0("1974–", fim))
+
+# Base cumulativa: para cada linha, replica até cada corte >= ano
+base_palavras_cum <- base_palavras %>%
+  select(id, ano_de_defesa, palavras_chave) %>%
+  tidyr::crossing(cutoffs) %>%
+  filter(ano_de_defesa >= 1974, ano_de_defesa <= fim) %>%
+  select(periodo, id, palavras_chave)
+
+# 1 ocorrência por palavra/doc/periodo acumulado
+base_palavras_cum_nodup <- base_palavras_cum %>%
+  distinct(periodo, id, palavras_chave)
+
+# NÓS cumulativos
+nodes_cum <- base_palavras_cum %>%
+  group_by(periodo, palavras_chave) %>%
+  summarise(
+    freq   = n(),
+    n_docs = n_distinct(id),
+    .groups = "drop"
+  ) %>%
+  transmute(
+    periodo,
+    id    = palavras_chave,
+    label = palavras_chave,
+    freq,
+    n_docs
+  )
+
+# ARESTAS cumulativas (não direcionais)
+edges_cum <- base_palavras_cum_nodup %>%
+  group_by(periodo, id) %>%
+  summarise(palavras = list(palavras_chave), .groups = "drop") %>%
+  mutate(
+    pares = purrr::map(palavras, ~ {
+      v <- sort(unique(.x))
+      if (length(v) > 1) combn(v, 2, simplify = FALSE) else NULL
+    })
+  ) %>%
+  select(-palavras) %>%
+  unnest(pares) %>%
+  mutate(
+    source = purrr::map_chr(pares, 1),
+    target = purrr::map_chr(pares, 2)
+  ) %>%
+  count(periodo, source, target, name = "weight")
+
+# Exportação cumulativa
+dir.create("gephi_export_cum", showWarnings = FALSE)
+uniq_per <- nodes_cum %>% distinct(periodo) %>% pull(periodo)
+
+for (p in uniq_per) {
+  readr::write_csv(
+    nodes_cum %>% filter(periodo == p) %>% select(-periodo),
+    file = file.path("gephi_export_cum", paste0("nodes_", p, ".csv"))
+  )
+  readr::write_csv(
+    edges_cum %>% filter(periodo == p) %>% select(-periodo),
+    file = file.path("gephi_export_cum", paste0("edges_", p, ".csv"))
+  )
+}
+
+# readr::write_csv(nodes_cum, file.path("gephi_export_cum", "nodes_todos_periodos.csv"))
+# readr::write_csv(edges_cum, file.path("gephi_export_cum", "edges_todos_periodos.csv"))
+
+# 18) ORIENTAÇÕES POR DOCENTE — usando a base já limpa
+#     (base_orientadores deriva de base_de_dados com clean_names()
+#      e coluna 'periodo' já definida no Bloco 1)
+base_orientadores <- base_de_dados
+
+base_orientadores_palavras <- base_orientadores %>%
+  # Remove colunas não usadas neste objeto (mesma intenção do seu select original)
+  select(
+    -any_of(c("link_de_acesso",
+              "coorientador","avaliador_1","avaliador_2","avaliador_3"))
+    ,
+    -tidyselect::matches("^palavra_chave_[0-9]+$")
+  ) %>%
+  filter(!is.na(palavras_chave)) %>%
+  mutate(palavras_chave = stringr::str_squish(palavras_chave)) %>%
+  tidyr::separate_rows(palavras_chave, sep = ";") %>%
+  mutate(palavras_chave = stringr::str_trim(palavras_chave)) %>%
+  filter(!(tolower(palavras_chave) == "sociologia"))
+
+# Para salvar PNG (se desejar):
+# gt::gtsave(gt_tbl_orientadores, "top5_ori_dec.png", vwidth = 1000, vheight = 900, expand = 5)
+
+# 19) Concentração das orientações (curva cumulativa)
+por_docente_orient <- base_orientadores %>%
+  filter(!is.na(orientador)) %>%
+  count(orientador, name = "n") %>%
+  arrange(dplyr::desc(n)) %>%
+  mutate(
+    rank = dplyr::row_number(),
+    perc = 100 * n / sum(n),
+    perc_acum_dissert = cumsum(perc),      # % acumulada de dissertações
+    n_docentes_acum   = rank               # nº acumulado de orientadores
+  )
+
+total_docentes_orient <- nrow(por_docente_orient)
+
+marcos <- c(50, 80, 90, 95)
+marcos_df_orient <- lapply(marcos, function(alvo){
+  linha <- por_docente_orient %>% filter(perc_acum_dissert >= alvo) %>% slice(1)
+  tibble::tibble(
+    alvo_perc       = alvo,
+    x_perc_dissert  = linha$perc_acum_dissert,
+    y_n_docentes    = linha$n_docentes_acum,
+    y_perc_docentes = 100 * linha$n_docentes_acum / total_docentes_orient
+  )
+}) %>% dplyr::bind_rows()
+
+ggplot(por_docente_orient, aes(x = perc_acum_dissert, y = n_docentes_acum)) +
+  geom_line(color = "grey20", linewidth = 1) +
+  geom_point(data = marcos_df_orient,
+             aes(x = x_perc_dissert, y = y_n_docentes),
+             size = 2.2, color = "grey30") +
+  geom_text(data = marcos_df_orient,
+            aes(x = x_perc_dissert, y = y_n_docentes,
+                label = paste0(y_n_docentes, " docentes")),
+            vjust = -0.8, hjust = 0.5, size = 3.2, color = "grey20") +
+  geom_vline(xintercept = marcos, linetype = "dashed", color = "grey60", linewidth = 0.4) +
+  scale_x_continuous(
+    limits = c(0, 100),
+    breaks = seq(0, 100, by = 10),
+    labels = function(x) paste0(x, "%")
+  ) +
+  scale_y_continuous(
+    name = "Nº acumulado de orientadores",
+    sec.axis = sec_axis(~ . / total_docentes_orient * 100,
+                        name = "% acumulado de orientadores",
+                        labels = function(x) paste0(round(x), "%"))
+  ) +
+  labs(
+    x = "% acumulado de orientações",
+    title = "Concentração das orientações de dissertações (1974–2024)",
+    subtitle = "Linha = cumulativo | Pontos = marcos de 50%, 80%, 90% e 95%"
+  ) +
+  theme_minimal() +
+  theme(
+    panel.grid.major.x = element_blank(),
+    panel.grid.minor   = element_blank(),
+    panel.grid.major.y = element_line(color = "grey85"),
+    plot.title = element_text(face = "bold"),
+    plot.subtitle = element_text(size = 10)
+  )
+
+# 20) Top 30 orientadores — tabela única com frequência acumulada
+# 20.1) Top 30 orientadores (contagem geral + freq. acumulada)
+top30_orientadores <- base_orientadores %>%
+  filter(!is.na(orientador), orientador != "") %>%
+  count(orientador, name = "n") %>%
+  arrange(dplyr::desc(n), orientador) %>%
+  mutate(
+    freq_rel  = n / sum(n),           # frequência relativa (0–1)
+    freq_acum = cumsum(freq_rel),     # frequência acumulada (0–1)
+    rank      = dplyr::row_number()
+  ) %>%
+  dplyr::select(rank, orientador, n, freq_rel, freq_acum) %>%
+  dplyr::slice_head(n = 30)
+
+# 20.2) linha de TOTAL (somatório dos top 30)
+linha_total <- top30_orientadores %>%
+  summarise(
+    rank       = "Total",
+    orientador = "",
+    n          = sum(n),
+    freq_rel   = sum(freq_rel),
+    freq_acum  = max(freq_acum)       # igual à soma da freq_rel
+  )
+
+# 20.3) juntar dados + total em um único data frame
+top30_display <- top30_orientadores %>%
+  mutate(rank = as.character(rank)) %>%
+  dplyr::bind_rows(linha_total)
+
+# 20.4) tabela gt com estilo + linha final em cinza
+gt_top30_orientadores <- top30_display %>%
+  gt() %>%
+  cols_label(
+    rank       = "Posição",
+    orientador = "Orientador",
+    n          = "Frequência",
+    freq_rel   = "Frequência relativa",
+    freq_acum  = "Frequência acumulada"
+  ) %>%
+  opt_stylize(style = 6, color = "gray") %>%
+  opt_table_outline() %>%
+  tab_options(
+    table.align = "left",
+    table.width = px(900)
+  ) %>%
+  cols_width(
+    rank       ~ px(80),
+    orientador ~ px(320),
+    n          ~ px(160),
+    freq_rel   ~ px(160),
+    freq_acum  ~ px(180)
+  ) %>%
+  fmt_number(
+    columns = n,
+    decimals = 0,
+    sep_mark = ".",
+    dec_mark = ","
+  ) %>%
+  fmt_percent(
+    columns = c(freq_rel, freq_acum),
+    decimals = 2,
+    sep_mark = ".",
+    dec_mark = ","
+  ) %>%
+  # destacar a última linha (Total)
+  tab_style(
+    style = list(
+      cell_fill(color = "grey85"),
+      cell_text(weight = "bold")
+    ),
+    locations = cells_body(
+      rows = rank == "Total"
+    )
+  )
+
+gt_top30_orientadores
+#gtsave(gt_top30_orientadores, "top30_orientadores.png", vwidth = 950, vheight = 1100, zoom = 2)
+
+orientador_decada <- base_orientadores %>%
+   group_by(periodo, orientador) %>%
+   summarise(n = n(), .groups = "drop")
+
+orientadores_top10_decada <- orientador_decada %>%
+  group_by(periodo) %>%
+  mutate(rk = dplyr::min_rank(dplyr::desc(n))) %>%  # ranking por frequência
+  filter(rk <= 10) %>%                              # top 10 (com empates)
+  arrange(periodo, dplyr::desc(n), orientador) %>%
+  summarise(
+    orientadores = str_c(paste0(orientador, " (", n, ")"), collapse = "; "),
+    .groups = "drop"
+  ) %>%
+  arrange(periodo)
+
+gt_top10_orientadores_decada <- orientadores_top10_decada %>%
+  gt() %>%
+  cols_label(
+    periodo      = "Período",
+    orientadores = "Orientadores (freq.)"
+  ) %>%
+  opt_stylize(style = 6, color = "gray") %>%
+  opt_table_outline() %>%
+  tab_options(
+    table.align     = "left",
+    table.width     = px(900),
+    table.font.size = px(14),
+    data_row.padding = px(6),
+    heading.align   = "center"
+  ) %>%
+  cols_width(
+    periodo      ~ px(120),
+    orientadores ~ px(750)
+  ) %>%
+  cols_align(
+    columns = periodo,      align = "center"
+  ) %>%
+  cols_align(
+    columns = orientadores, align = "left"
+  )
+
+gt_top10_orientadores_decada
+#gtsave(gt_top10_orientadores_decada, "top10_orientadores_decada.png", vwidth  = 1000, vheight = 800, zoom = 2)
+
+# 21) AVALIADORES — usando a base já limpa (base_de_dados)
+#     - Constrói base longa com um avaliador por linha
+#     - Calcula Top 30 avaliadores (geral e por período)
+# 21.1) Base de avaliadores (uma linha por avaliador por dissertação)
+base_avaliadores <- base_de_dados %>%
+  # mantém tudo que você possa precisar (inclui periodo, etc.)
+  select(
+    id, periodo,
+    starts_with("avaliador_")
+  ) %>%
+  # empilha avaliador_1, avaliador_2, avaliador_3 em uma coluna só
+  pivot_longer(
+    cols = starts_with("avaliador_"),
+    names_to  = "tipo_avaliador",
+    values_to = "avaliador"
+  ) %>%
+  # trata "NA" como NA real e tira vazios
+  mutate(
+    avaliador = na_if(avaliador, "NA"),
+    avaliador = str_squish(avaliador)
+  ) %>%
+  filter(!is.na(avaliador), avaliador != "")
+
+# 21.2) Top 30 avaliadores (contagem geral + frequência acumulada)
+top30_avaliadores <- base_avaliadores %>%
+  count(avaliador, name = "n") %>%
+  arrange(desc(n), avaliador) %>%
+  mutate(
+    freq_rel  = n / sum(n),          # frequência relativa
+    freq_acum = cumsum(freq_rel),    # frequência acumulada
+    rank      = row_number()
+  ) %>%
+  select(rank, avaliador, n, freq_rel, freq_acum) %>%
+  slice_head(n = 30)
+
+# 21.3) Linha de TOTAL
+linha_total_avaliadores <- top30_avaliadores %>%
+  summarise(
+    rank       = "Total",
+    avaliador  = "",
+    n          = sum(n),
+    freq_rel   = sum(freq_rel),
+    freq_acum  = max(freq_acum)
+  )
+
+# 21.4) Junta dados + total
+top30_display_avaliadores <- top30_avaliadores %>%
+  mutate(rank = as.character(rank)) %>%
+  bind_rows(linha_total_avaliadores)
+
+# 21.5) Tabela gt
+gt_top30_avaliadores <- top30_display_avaliadores %>%
+  gt() %>%
+  cols_label(
+    rank      = "Posição",
+    avaliador = "Avaliador",
+    n         = "Frequência",
+    freq_rel  = "Frequência relativa",
+    freq_acum = "Frequência acumulada"
+  ) %>%
+  opt_stylize(style = 6, color = "gray") %>%
+  opt_table_outline() %>%
+  tab_options(
+    table.align = "left",
+    table.width = px(900)
+  ) %>%
+  cols_width(
+    rank      ~ px(80),
+    avaliador ~ px(320),
+    n         ~ px(160),
+    freq_rel  ~ px(160),
+    freq_acum ~ px(180)
+  ) %>%
+  fmt_number(
+    columns = n,
+    decimals = 0,
+    sep_mark = ".",
+    dec_mark = ","
+  ) %>%
+  fmt_percent(
+    columns = c(freq_rel, freq_acum),
+    decimals = 2,
+    sep_mark = ".",
+    dec_mark = ","
+  ) %>%
+  tab_style(
+    style = list(
+      cell_fill(color = "grey85"),
+      cell_text(weight = "bold")
+    ),
+    locations = cells_body(
+      rows = rank == "Total"
+    )
+  )
+
+gt_top30_avaliadores
+
+gtsave(gt_top30_avaliadores, "top30_avaliadores.png", vwidth = 950, vheight = 1100, zoom = 2)
+
+# 21.6) Top 10 avaliadores por período (com empates)
+avaliador_decada <- base_avaliadores %>%
+  group_by(periodo, avaliador) %>%
+  summarise(n = n(), .groups = "drop")
+
+avaliadores_top10_decada <- avaliador_decada %>%
+  group_by(periodo) %>%
+  mutate(rk = min_rank(desc(n))) %>%   # ranking por frequência
+  filter(rk <= 10) %>%                # top 10 (inclui empates)
+  arrange(periodo, desc(n), avaliador) %>%
+  summarise(
+    avaliadores = str_c(paste0(avaliador, " (", n, ")"), collapse = "; "),
+    .groups = "drop"
+  ) %>%
+  arrange(periodo)
+
+gt_top10_avaliadores_decada <- avaliadores_top10_decada %>%
+  gt() %>%
+  cols_label(
+    periodo     = "Período",
+    avaliadores = "Avaliadores (freq.)"
+  ) %>%
+  opt_stylize(style = 6, color = "gray") %>%
+  opt_table_outline() %>%
+  tab_options(
+    table.align      = "left",
+    table.width      = px(900),
+    table.font.size  = px(14),
+    data_row.padding = px(6),
+    heading.align    = "center"
+  ) %>%
+  cols_width(
+    periodo     ~ px(120),
+    avaliadores ~ px(750)
+  ) %>%
+  cols_align(columns = periodo,     align = "center") %>%
+  cols_align(columns = avaliadores, align = "left")
+
+gt_top10_avaliadores_decada
+
+#gtsave(gt_top10_avaliadores_decada, "top10_avaliadores_decada.png", vwidth  = 1000, vheight = 800, zoom = 2)
+
+# 22) REDE DOCENTE (Orientador x Avaliadores) — base_orientadores
+#     - Usa colunas já em snake_case: id, orientador, avaliador_1..3
+# 22.1) Limpeza e pivotagem (gera base longa só com avaliadores válidos)
+base_rede_docente <- base_orientadores %>%
+  transmute(
+    id,
+    orientador  = stringr::str_squish(orientador),
+    avaliador_1 = stringr::str_squish(as.character(avaliador_1)),
+    avaliador_2 = stringr::str_squish(as.character(avaliador_2)),
+    avaliador_3 = stringr::str_squish(as.character(avaliador_3))
+  ) %>%
+  dplyr::mutate(
+    dplyr::across(
+      dplyr::starts_with("avaliador"),
+      ~ .x |> dplyr::na_if("") |> dplyr::na_if("NA") |> dplyr::na_if("Na") |>
+        dplyr::na_if("N/A") |> dplyr::na_if("-")  |> dplyr::na_if("—")  |> dplyr::na_if("–")
+    )
+  ) %>%
+  tidyr::pivot_longer(
+    cols           = dplyr::starts_with("avaliador"),
+    names_to       = "tipo",
+    values_to      = "avaliador",
+    values_drop_na = TRUE
+  )
+
+# 22.2) Arestas (sem direção), peso = nº de dissertações em comum
+edges_docentes <- base_rede_docente %>%
+  dplyr::transmute(source = orientador, target = avaliador) %>%
+  dplyr::filter(source != target) %>%                 # remove auto-laços por segurança
+  dplyr::group_by(source, target) %>%
+  dplyr::summarise(weight = dplyr::n(), .groups = "drop") %>% # colapsa duplicatas
+  dplyr::arrange(dplyr::desc(weight), source, target)
+
+# 22.3) Nós (Id, Label, Tipo = orientador se já apareceu como source; senão, avaliador)
+nodes_docentes <- edges_docentes %>%
+  dplyr::select(source, target) %>%
+  tidyr::pivot_longer(cols = dplyr::everything(), values_to = "nome") %>%
+  dplyr::distinct(nome) %>%
+  dplyr::mutate(
+    Id    = nome,
+    Label = nome,
+    Tipo  = dplyr::if_else(nome %in% edges_docentes$source, "orientador", "avaliador")
+  ) %>%
+  dplyr::select(Id, Label, Tipo) %>%
+  dplyr::arrange(Tipo, Label)
+
+# 22.4) Export para Gephi (descomente para salvar)
+# readr::write_csv(edges_docentes, "edges_orientador_avaliador.csv")  # colunas: source,target,weight
+# readr::write_csv(nodes_docentes, "nodes_orientador_avaliador.csv")  # colunas: Id,Label,Tipo
