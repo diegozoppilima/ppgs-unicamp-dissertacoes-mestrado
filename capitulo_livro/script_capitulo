@@ -1,0 +1,896 @@
+# Análise quantitativa dos títulos e palavras-chave
+# Programa de Pós-Graduação em Sociologia — Unicamp (1974–2024)
+
+# 0) Pacotes
+library(tidyverse)
+library(tidytext)
+library(stringi)
+library(stopwords)
+library(gt)
+library(readxl)
+library(janitor)
+
+# 1) Leitura e padronização da base
+# Faça o download da tabela no Dataverse da Unicamp: doi:10.25824/redu/7BDBVD
+# Salve o arquivo .xlsx na mesma pasta deste script
+# Verifique o diretório de trabalho com: getwd()
+# Para alterar: setwd("caminho/para/a/pasta")
+
+base_de_dados <- read_xlsx("dissertacoes.xlsx") %>%
+  clean_names() %>%
+  mutate(
+    ano_de_defesa = as.integer(ano_de_defesa),
+    doc_id = row_number(),
+    periodo = case_when(
+      ano_de_defesa >= 1974 & ano_de_defesa <= 1983 ~ "1974–1983",
+      ano_de_defesa >= 1984 & ano_de_defesa <= 1993 ~ "1984–1993",
+      ano_de_defesa >= 1994 & ano_de_defesa <= 2003 ~ "1994–2003",
+      ano_de_defesa >= 2004 & ano_de_defesa <= 2013 ~ "2004–2013",
+      ano_de_defesa >= 2014 & ano_de_defesa <= 2024 ~ "2014–2024",
+      TRUE ~ NA_character_
+    )
+  ) %>%
+  filter(ano_de_defesa >= 1974, ano_de_defesa <= 2024)
+
+# 1.1) Base anual completa (1974–2024)
+base_ano <- base_de_dados %>%
+  count(ano_de_defesa, name = "n") %>%
+  complete(ano_de_defesa = 1974:2024, fill = list(n = 0)) %>%
+  arrange(ano_de_defesa) %>%
+  mutate(
+    freq_pct_global      = 100 * n / sum(n),
+    freq_pct_acum_global = 100 * cumsum(n) / sum(n)
+  )
+
+# 2) Funções auxiliares
+normalizar_base <- function(x) {
+  x %>%
+    str_to_lower() %>%
+    stri_trans_general("Latin-ASCII") %>%
+    str_replace_all("-", "_") %>%
+    str_replace_all("['`']", " ") %>%
+    str_replace_all("&", " ") %>%
+    str_replace_all("[^[:alnum:]_]+", " ") %>%
+    str_squish()
+}
+
+aplicar_mapa_substituicoes <- function(texto, mapa) {
+  if (length(mapa) == 0) return(texto)
+  chaves <- names(mapa)[order(nchar(names(mapa)), decreasing = TRUE)]
+  purrr::reduce(
+    chaves,
+    .init = texto,
+    .f = function(txt, chave) {
+      padrao <- chave %>%
+        str_replace_all("([\\^$.|?*+(){}\\[\\]\\\\])", "\\\\\\1") %>%
+        str_replace_all("\\s+", "\\\\s+")
+      padrao <- paste0("(?<![[:alnum:]_])", padrao, "(?![[:alnum:]_])")
+      str_replace_all(txt, regex(padrao, ignore_case = FALSE), mapa[[chave]])
+    }
+  )
+}
+
+formatar_token <- function(x) {
+  str_to_title(str_replace_all(x, "_", " "))
+}
+
+criar_tabela_freq <- function(df, termo_col, n_top = 30, termo_label = "Termo") {
+  termo_col <- rlang::ensym(termo_col)
+  total_n <- sum(df$n)
+  df %>%
+    arrange(desc(n), !!termo_col) %>%
+    mutate(
+      rank      = row_number(),
+      freq_rel  = n / total_n,
+      termo_fmt = formatar_token(!!termo_col)
+    ) %>%
+    select(rank, termo_fmt, n, freq_rel) %>%
+    slice_head(n = n_top) %>%
+    gt() %>%
+    fmt_percent(columns = freq_rel, decimals = 2) %>%
+    cols_label(
+      rank      = "Posição",
+      termo_fmt = termo_label,
+      n         = "Frequência",
+      freq_rel  = "Frequência relativa"
+    ) %>%
+    opt_stylize(style = 6, color = "gray") %>%
+    opt_table_outline() %>%
+    tab_options(table.align = "left", table.width = px(700))
+}
+
+# Colapsa tokens por período em string para exibição no quadro.
+# n_min = limiar exclusivo: inclui apenas n > n_min
+# Portanto: n_min = 2 → n >= 3; n_min = 1 → n >= 2
+colapsar_por_periodo <- function(df, termo_col, n_min = 1,
+                                 nome_coluna = "Itens (freq.)") {
+  termo_col <- rlang::ensym(termo_col)
+  df %>%
+    count(periodo, !!termo_col, sort = TRUE, name = "n") %>%
+    group_by(periodo) %>%
+    filter(n > n_min) %>%
+    ungroup() %>%
+    mutate(item = sprintf("%s (%d)", formatar_token(!!termo_col), n)) %>%
+    group_by(periodo) %>%
+    summarise(
+      !!nome_coluna := str_c(item, collapse = "; "),
+      .groups = "drop"
+    ) %>%
+    arrange(periodo)
+}
+
+# Função auxiliar para colapsar subconjunto com limiar específico
+colapsar_subset <- function(df, termo_col, n_min, nome_coluna) {
+  termo_col <- rlang::ensym(termo_col)
+  df %>%
+    count(periodo, !!termo_col, sort = TRUE, name = "n") %>%
+    group_by(periodo) %>%
+    filter(n > n_min) %>%
+    ungroup() %>%
+    mutate(item = sprintf("%s (%d)", formatar_token(!!termo_col), n)) %>%
+    group_by(periodo) %>%
+    summarise(!!nome_coluna := str_c(item, collapse = "; "), .groups = "drop") %>%
+    arrange(periodo)
+}
+
+# Normaliza descritores de autores nas palavras-chave do formato
+# "Sobrenome, Nome, Ano" para "Nome Sobrenome"
+normalizar_autor_keyword <- function(keyword) {
+  keyword <- str_remove(
+    keyword,
+    "\\s*[-–]\\s*(critica|vida|miseria|o capital|sao bernardo|triste|historia|guerra|republica).*$"
+  )
+  keyword <- str_remove(keyword, "\\s*\\.\\s*(?=[a-z]{2,}).*$")
+  keyword <- str_remove(keyword, ",\\s*\\d{3,4}\\s*[-–]?\\s*\\d{0,4}\\s*$")
+  keyword <- str_remove_all(keyword, "\\s*\\([^)]*\\)")
+  partes  <- str_split(keyword, ",\\s*", simplify = TRUE)
+  if (ncol(partes) >= 2 && str_trim(partes[1, 2]) != "") {
+    keyword <- str_c(str_trim(partes[1, 2]), str_trim(partes[1, 1]), sep = " ")
+  }
+  keyword %>%
+    stri_trans_general("Latin-ASCII") %>%
+    str_to_title() %>%
+    str_squish()
+}
+
+# 3) Stopwords
+stop_geograficos <- c(
+  "sao_paulo", "rio_grande_do_norte", "sao_luiz_pirassununga",
+  "rio_pardo", "alta_floresta", "mato_grosso", "norte_do_parana",
+  "norte_matogrossense", "estado_do_para", "litoral_norte_paulista",
+  "sao_sebastiao", "distrito_de_maresias", "amazonia_mato_grossense",
+  "vale_do_sao_francisco", "rio_grande_do_sul", "itatiaia",
+  "litoral_sul", "vale_do_ribeira_de_iguape", "vale_do_ribeira",
+  "sao_jose_do_rio_preto", "rio_tiete", "municipio_de_campinas",
+  "vale_do_paraiba", "sao_jose_dos_campos", "estados_unidos",
+  "alto_jurua_acre", "governador_valadares", "rio_paraiba_do_sul",
+  "rio_de_janeiro", "rio_machado", "zona_da_mata_pernambucana",
+  "sao_carlos", "santo_antonio_do_pinhal", "serra_do_mar",
+  "nucleo_picinguaba", "rua_25_de_marco", "rio_claro",
+  "ilha_do_ferro", "vila_madalena", "beco_do_batman",
+  "ribeirao_preto", "la_plata", "vale_do_paraiba_paulista",
+  "campinas", "brasil", "brasilia", "paulinia", "parana",
+  "rondonia", "acre", "chile", "europa", "italia", "japao", "paris",
+  "estado_de_sao_paulo", "cidade_de_sao_paulo",
+  "sao", "rio", "paulo", "sp"
+)
+
+stop_base <- unique(c(
+  stopwords("pt", source = "snowball"),
+  "sobre", "estudo", "caso", "analise", "anos",
+  "pesquisa", "nao", "partir", "processo", "dissertacao",
+  "tambem", "objetivo", "ensaio", "contribuicao",
+  "debate", "condicoes", "local", "aspectos", "assim", "presente",
+  "desta", "quais", "sentido", "neste", "nesse", "compreender",
+  "analisar", "atraves", "principais", "parte", "periodo", "questao",
+  "diferentes", "fim", "tal", "alem", "tanto", "aprende", "chao",
+  "dirigida", "projeto", "acesso", "sob", "propostas", "concepcoes",
+  "elementos", "olhar", "primeiros", "segundo", "torno", "grupo",
+  "introducao", "conceito", "busca", "consideracoes", "desde", "duas",
+  "ha", "hoje", "perimetro", "prometida", "revisitada", "abordagem",
+  "acerca", "alcance", "avancos", "chegou", "condicao",
+  "brasileiros", "brasileira", "brasileiro", "seculo", "xix"
+))
+
+stop_unigrama <- unique(c(
+  stop_base, stop_geograficos,
+  "sociologia",
+  "vida", "relacoes", "experiencia", "sociedade", "social", "sociais",
+  "construcao"
+))
+
+stop_bigrama <- unique(c(stop_base, stop_geograficos))
+
+# 4) Expressões compostas e aliases de autores
+expressoes_compostas <- c(
+  "Sao Paulo", "Paulo Freire", "Rio Grande do Norte",
+  "Sao Luiz Pirassununga", "Rio Pardo", "cultura de cebola",
+  "Alta Floresta", "Cia Paulista", "Mato Grosso", "Vila Costa e Silva",
+  "Norte do Parana", "Tugan Baranovsty", "Norte Matogrossense",
+  "estado do para", "litoral norte paulista", "Sao Sebastiao",
+  "Distrito de Maresias", "amazonia mato grossense",
+  "vale do sao francisco", "Rio Grande do Sul", "Itatiaia",
+  "Litoral Sul", "Vale do Ribeira de Iguape", "Celso Furtado",
+  "cia da cidade", "Sergio Milliet", "Karl Marx", "Marx Engels",
+  "Vale do Ribeira", "Sao Jose do Rio Preto", "Raizes do Brasil",
+  "Palestra Italia", "Mario de Andrade", "Rio Tiete",
+  "municipio de campinas", "Pacheco e Chaves", "Vale do Paraiba",
+  "Sao Jose dos Campos", "Estados Unidos", "Igreja Presbiteriana",
+  "Lima Barreto", "primeira republica", "Sao Roque", "Manoel Bomfim",
+  "Atlantica cinematografica S A", "Lima Peru",
+  "Movimento dos Trabalhadores Rurais Sem Terra",
+  "Promotorias de Justica da Comunidade", "Alto Jurua Acre",
+  "Andre Gorz", "Igreja Universal", "Bye Bye Brasil",
+  "Carlos Diegues", "Pastoral da Juventude", "Oswald de Andrade",
+  "hare krishna", "Garoto Bombril", "Governador Valadares",
+  "revista o progresso", "raymundo faoro", "Os donos do poder",
+  "Max Weber", "Theodor Adorno", "Estacao Ecologica da Jureia_Itatins",
+  "Theodor W Adorno", "Vila Ilze", "Poder Judiciario Federal",
+  "Ministerio Publico da Uniao", "Banco do Brasil", "Rio Paraiba do Sul",
+  "Clovis Moura", "Heitor Villa Lobos", "Anthony Giddens",
+  "Oliveira Vianna", "Instituto Historico de Paris",
+  "Graciliano Ramos", "Rino Levi", "Mario Covas", "Tobias Barreto",
+  "Santo Andre", "Planta Anchieta", "Nacoes Unidas",
+  "Carlos Eugenio Paz", "Maria Claudia Badan Ribeiro",
+  "Roberto Schwarz", "America Latina", "Manifesto Comunista",
+  "Lars von Trier", "Zanini S A", "Casa_grande senzala",
+  "Regiao Metropolitana de Campinas", "Rio de Janeiro",
+  "Jose Lins do Rego", "Miseria da Filosofia", "Ralf Dahrendorf",
+  "Manuscrito de 1844", "Ciencias Sociais",
+  "teatro experimental do negro", "Gilberto Freyre", "Rio Machado",
+  "Riot Grrrl", "Erico Verissimo", "Octavio Ianni", "Axel Honneth",
+  "Historia da Loucura", "O alienista", "Robert K Merton",
+  "Michael Lowy", "Ernst Junger", "Heiner Muller",
+  "Penintenciaria Feminina da Capital", "Votorantim Metais",
+  "Milton Hatoum", "Fredric Jameson", "Zona da Mata pernambucana",
+  "Colonia Cecilia", "Ulrich Beck", "Conselhos Comunitarios de Seguranca",
+  "Georg Simmel", "Florestan Fernandes", "Minha casa minha vida",
+  "Clube de Esquina", "Ernest Mandel", "Jurgen Habermas",
+  "O carro de exito", "Oswaldo de Camargo", "Sao Carlos",
+  "Istvan Meszaros", "Programa Bolsa Familia", "Santo Antonio do Pinhal",
+  "Nancy Fraser", "Caio Prado Junior", "Companhia America Movil",
+  "Instituto Millenium", "Maurice Halbwachs", "Casa dos Meninos",
+  "Marco Civil da Internet", "Jose Costa Leite",
+  "Triste fim de Policarpo Quaresma", "Pierre Bourdieu",
+  "Jose Ortega y Gasset", "Radio Rebelde", "Serra do Mar",
+  "Nucleo Picinguaba", "Gabriel Cohn", "Rua 25 de Marco",
+  "Bairro Veronetta", "Dilma Rousseff",
+  "Conferencia Mundial de Telecomunicacoes Internacionais",
+  "Charlie Hebdo", "Jornal Nacional", "Breaking the waves",
+  "E P Thompson", "Lygia Clark", "Jesus Rafael Soto",
+  "Beatriz Sarlo", "Milton Nascimento", "Fazenda Pirituba",
+  "Niklas Luhmann", "Gilda de Mello e Souza",
+  "Ministerio Publico Federal", "Ile Aiye", "Rio Claro",
+  "Ilha do Ferro", "Vila Madalena", "Beco do Batman",
+  "Instituto Unibanco", "Mario Lago", "Ribeirao Preto",
+  "Sueli Carneiro", "Red Bull", "La Plata",
+  "Vale do Paraiba Paulista", "Racionais MC s",
+  "Universidade Estadual de Campinas", "Universal do Reino de Deus",
+  "Sul Global", "Ana Cristina Cesar", "Friedrich Engels",
+  "Walter Benjamin", "estado de sao paulo", "municipio de sao paulo",
+  "grande sao paulo", "Georg Lukacs", "Vladimir Lenin",
+  "Charles Baudelaire", "Guy Debord", "Sigmund Freud",
+  "Jacques Lacan", "Emile Durkheim", "Iris Marion Young",
+  "Antonio Gramsci"
+)
+
+expressoes_norm <- expressoes_compostas %>%
+  normalizar_base() %>%
+  unique()
+
+mapa_expressoes <- set_names(
+  str_replace_all(expressoes_norm, "\\s+", "_"),
+  expressoes_norm
+)
+
+mapa_expressoes["marx engels"]      <- "karl_marx_friedrich_engels"
+mapa_expressoes["theodor w adorno"] <- "theodor_adorno"
+mapa_expressoes["ulrick beck"]      <- "ulrich_beck"
+
+aliases_autores <- c(
+  "fraser"     = "nancy_fraser",
+  "debord"     = "guy_debord",
+  "freud"      = "sigmund_freud",
+  "lacan"      = "jacques_lacan",
+  "durkheim"   = "emile_durkheim",
+  "weber"      = "max_weber",
+  "lukacs"     = "georg_lukacs",
+  "bourdieu"   = "pierre_bourdieu",
+  "habermas"   = "jurgen_habermas",
+  "freyre"     = "gilberto_freyre",
+  "lenin"      = "vladimir_lenin",
+  "marx"       = "karl_marx",
+  "adorno"     = "theodor_adorno",
+  "gramsci"    = "antonio_gramsci",
+  "simmel"     = "georg_simmel",
+  "honneth"    = "axel_honneth",
+  "benjamin"   = "walter_benjamin",
+  "meszaros"   = "istvan_meszaros",
+  "mandel"     = "ernest_mandel",
+  "thompson"   = "e_p_thompson",
+  "luhmann"    = "niklas_luhmann",
+  "jameson"    = "fredric_jameson",
+  "dahrendorf" = "ralf_dahrendorf",
+  "gorz"       = "andre_gorz",
+  "merton"     = "robert_k_merton",
+  "giddens"    = "anthony_giddens",
+  "baudelaire" = "charles_baudelaire",
+  "young"      = "iris_marion_young",
+  "lowy"       = "michael_lowy"
+)
+
+# 4.1) Tokens de autores para títulos
+nomes_autores_raw <- c(
+  "Tugan Baranovsty", "Celso Furtado", "Sergio Milliet",
+  "Karl Marx", "Marx Engels", "Mario de Andrade", "Lima Barreto",
+  "Manoel Bomfim", "Andre Gorz", "Carlos Diegues", "Oswald de Andrade",
+  "raymundo faoro", "Max Weber", "Theodor Adorno", "Theodor W Adorno",
+  "Clovis Moura", "Heitor Villa Lobos", "Anthony Giddens",
+  "Oliveira Vianna", "Graciliano Ramos", "Tobias Barreto", "Rino Levi",
+  "Carlos Eugenio Paz", "Maria Claudia Badan Ribeiro", "Roberto Schwarz",
+  "Lars von Trier", "Jose Lins do Rego", "Ralf Dahrendorf",
+  "Gilberto Freyre", "Erico Verissimo", "Octavio Ianni", "Axel Honneth",
+  "Robert K Merton", "Michael Lowy", "Ernst Junger", "Heiner Muller",
+  "Milton Hatoum", "Fredric Jameson", "Ulrich Beck", "Georg Simmel",
+  "Florestan Fernandes", "Ernest Mandel", "Jurgen Habermas",
+  "Oswaldo de Camargo", "Istvan Meszaros", "Nancy Fraser",
+  "Caio Prado Junior", "Maurice Halbwachs", "Jose Ortega y Gasset",
+  "Gabriel Cohn", "Dilma Rousseff", "E P Thompson", "Lygia Clark",
+  "Jesus Rafael Soto", "Beatriz Sarlo", "Milton Nascimento",
+  "Niklas Luhmann", "Gilda de Mello e Souza", "Mario Lago",
+  "Sueli Carneiro", "Racionais MC s", "Ana Cristina Cesar",
+  "Friedrich Engels", "Walter Benjamin", "Georg Lukacs", "Vladimir Lenin",
+  "Charles Baudelaire", "Guy Debord", "Sigmund Freud", "Jacques Lacan",
+  "Emile Durkheim", "Iris Marion Young", "Antonio Gramsci",
+  "Paulo Freire", "Pierre Bourdieu"
+)
+
+autores_tokens <- unique(c(
+  nomes_autores_raw %>%
+    normalizar_base() %>%
+    str_replace_all("\\s+", "_"),
+  unname(aliases_autores)
+))
+
+# 4.2) Mapa de harmonização de nomes entre fontes
+mapa_harmonizacao <- c(
+  "Theodor W. Adorno"     = "Theodor Adorno",
+  "Vladimir Ilitch Lenin" = "Vladimir Lenin",
+  "Gyorgy Lukacs"         = "Georg Lukacs",
+  "Frederic Jameson"      = "Fredric Jameson",
+  "E. P. Thompson"        = "E P Thompson"
+)
+
+harmonizar_nome <- function(x) {
+  ifelse(x %in% names(mapa_harmonizacao), mapa_harmonizacao[x], x)
+}
+
+# 5) Normalização da base de títulos
+base_titulos <- base_de_dados %>%
+  mutate(
+    titulo_norm = titulo %>%
+      normalizar_base() %>%
+      aplicar_mapa_substituicoes(mapa_expressoes) %>%
+      aplicar_mapa_substituicoes(aliases_autores)
+  ) %>%
+  select(doc_id, titulo, titulo_norm, ano_de_defesa, periodo)
+
+# 6) Tokenização de títulos
+tokenizar <- function(df, coluna_texto, stop_lista) {
+  coluna_texto <- rlang::ensym(coluna_texto)
+  df %>%
+    filter(!is.na(!!coluna_texto), !!coluna_texto != "") %>%
+    unnest_tokens(
+      palavra,
+      !!coluna_texto,
+      token = "regex",
+      pattern = "[^[:alnum:]_]+"
+    ) %>%
+    filter(
+      !is.na(palavra),
+      palavra != "",
+      !palavra %in% stop_lista,
+      !str_detect(palavra, "[0-9]"),
+      nchar(palavra) > 1
+    )
+}
+
+titulos_tokens_uni <- tokenizar(base_titulos, titulo_norm, stop_unigrama)
+titulos_tokens_bi  <- tokenizar(base_titulos, titulo_norm, stop_bigrama)
+
+# 7) Unigramas de títulos
+unigramas_freq <- titulos_tokens_uni %>%
+  count(palavra, sort = TRUE, name = "n")
+
+unigramas_autores <- unigramas_freq %>%
+  filter(palavra %in% autores_tokens)
+
+unigramas_temas <- unigramas_freq %>%
+  filter(!palavra %in% autores_tokens)
+
+gt_unigramas_temas <- criar_tabela_freq(
+  unigramas_temas, palavra, n_top = 30, termo_label = "Unigrama"
+)
+gt_unigramas_autores <- criar_tabela_freq(
+  unigramas_autores %>% filter(n >= 2),
+  palavra, n_top = 30, termo_label = "Autor"
+)
+
+gt_unigramas_temas
+gt_unigramas_autores
+
+# 8) Bigramas de títulos
+titulos_filtrados <- titulos_tokens_bi %>%
+  group_by(doc_id, ano_de_defesa, periodo) %>%
+  summarise(
+    titulo_filtrado = str_c(palavra, collapse = " "),
+    .groups = "drop"
+  ) %>%
+  filter(!is.na(titulo_filtrado), titulo_filtrado != "")
+
+bigrams_limpos <- titulos_filtrados %>%
+  unnest_tokens(bigrama, titulo_filtrado, token = "ngrams", n = 2) %>%
+  filter(!is.na(bigrama), bigrama != "")
+
+bigrams_freq <- bigrams_limpos %>%
+  count(bigrama, sort = TRUE, name = "n")
+
+gt_bigrams <- criar_tabela_freq(
+  bigrams_freq, bigrama, n_top = 30, termo_label = "Bigrama"
+)
+gt_bigrams
+
+# 9) Tabelas por período — títulos
+# Unigramas: n >= 3 para todos exceto 1974–1983 onde n >= 1
+# Bigramas:  n >= 2 para todos exceto 1974–1983 onde n >= 1
+# Autores:   n >= 2 para todos exceto 1974–1983 onde n >= 1
+tabela_unigramas_decada <- bind_rows(
+  colapsar_subset(
+    titulos_tokens_uni %>%
+      filter(!palavra %in% autores_tokens, periodo == "1974–1983"),
+    palavra, n_min = 0, nome_coluna = "Unigramas (freq.)"
+  ),
+  colapsar_subset(
+    titulos_tokens_uni %>%
+      filter(!palavra %in% autores_tokens, periodo != "1974–1983"),
+    palavra, n_min = 0, nome_coluna = "Unigramas (freq.)"
+  )
+) %>% arrange(periodo)
+
+tabela_bigrams_decada <- bind_rows(
+  colapsar_subset(
+    bigrams_limpos %>% filter(periodo == "1974–1983"),
+    bigrama, n_min = 0, nome_coluna = "Bigramas (freq.)"
+  ),
+  colapsar_subset(
+    bigrams_limpos %>% filter(periodo != "1974–1983"),
+    bigrama, n_min = 0, nome_coluna = "Bigramas (freq.)"
+  )
+) %>% arrange(periodo)
+
+tabela_autores_decada <- bind_rows(
+  titulos_tokens_uni %>%
+    filter(palavra %in% autores_tokens, periodo == "1974–1983") %>%
+    count(periodo, palavra, sort = TRUE, name = "n") %>%
+    filter(n >= 1),
+  titulos_tokens_uni %>%
+    filter(palavra %in% autores_tokens, periodo != "1974–1983") %>%
+    count(periodo, palavra, sort = TRUE, name = "n") %>%
+    filter(n >= 2)
+) %>%
+  mutate(item = sprintf("%s (%d)", formatar_token(palavra), n)) %>%
+  group_by(periodo) %>%
+  summarise(
+    `Autores (freq.)` = str_c(item, collapse = "; "),
+    .groups = "drop"
+  ) %>%
+  arrange(periodo)
+
+# 10) Palavras-chave
+stop_keywords <- c("sociologia")
+
+keywords_long <- base_de_dados %>%
+  select(doc_id, ano_de_defesa, periodo, palavras_chave) %>%
+  filter(!is.na(palavras_chave), palavras_chave != "") %>%
+  mutate(palavras_chave = str_split(palavras_chave, ";")) %>%
+  unnest(palavras_chave) %>%
+  mutate(keyword = palavras_chave %>% str_squish() %>% str_to_lower()) %>%
+  filter(!is.na(keyword), keyword != "", !keyword %in% stop_keywords)
+
+keywords_freq <- keywords_long %>%
+  count(keyword, sort = TRUE, name = "n")
+
+keywords_temas <- keywords_freq %>%
+  filter(!str_detect(keyword, ",\\s*\\d{4}"))
+
+gt_keywords_temas <- criar_tabela_freq(
+  keywords_temas, keyword, n_top = 30, termo_label = "Palavra-chave"
+)
+gt_keywords_temas
+
+# 10.0a) Tabela integrada — período completo
+n_linhas <- 30
+
+kw_top <- keywords_temas %>%
+  arrange(desc(n)) %>%
+  slice_head(n = n_linhas) %>%
+  mutate(
+    freq_rel_kw = n / sum(keywords_temas$n),
+    keyword     = str_to_sentence(keyword)
+  ) %>%
+  select(keyword, n_kw = n, freq_rel_kw)
+
+uni_top <- unigramas_temas %>%
+  arrange(desc(n)) %>%
+  slice_head(n = n_linhas) %>%
+  mutate(
+    freq_rel_uni = n / sum(unigramas_temas$n),
+    unigrama     = formatar_token(palavra)
+  ) %>%
+  select(unigrama, n_uni = n, freq_rel_uni)
+
+bi_top <- bigrams_freq %>%
+  arrange(desc(n)) %>%
+  slice_head(n = n_linhas) %>%
+  mutate(
+    freq_rel_bi = n / sum(bigrams_freq$n),
+    bigrama     = formatar_token(bigrama)
+  ) %>%
+  select(bigrama, n_bi = n, freq_rel_bi)
+
+tabela_geral_integrada <- bind_cols(
+  tibble(posicao = seq_len(n_linhas)),
+  kw_top,
+  uni_top,
+  bi_top
+)
+
+gt_geral_integrada <- tabela_geral_integrada %>%
+  gt() %>%
+  fmt_percent(
+    columns = c(freq_rel_kw, freq_rel_uni, freq_rel_bi),
+    decimals = 2
+  ) %>%
+  cols_label(
+    posicao      = "Posição",
+    keyword      = "Palavra-chave",
+    n_kw         = "Frequência",
+    freq_rel_kw  = "Freq. relativa",
+    unigrama     = "Unigrama",
+    n_uni        = "Frequência",
+    freq_rel_uni = "Freq. relativa",
+    bigrama      = "Bigrama",
+    n_bi         = "Frequência",
+    freq_rel_bi  = "Freq. relativa"
+  ) %>%
+  tab_spanner(
+    label   = "Palavras-chave",
+    columns = c(keyword, n_kw, freq_rel_kw)
+  ) %>%
+  tab_spanner(
+    label   = "Títulos — unigramas",
+    columns = c(unigrama, n_uni, freq_rel_uni)
+  ) %>%
+  tab_spanner(
+    label   = "Títulos — bigramas",
+    columns = c(bigrama, n_bi, freq_rel_bi)
+  ) %>%
+  grand_summary_rows(
+    columns = c(n_kw, freq_rel_kw, n_uni, freq_rel_uni, n_bi, freq_rel_bi),
+    fns = list(Total = ~ sum(., na.rm = TRUE)),
+    fmt = list(
+      ~ fmt_integer(., columns = c(n_kw, n_uni, n_bi)),
+      ~ fmt_percent(., columns = c(freq_rel_kw, freq_rel_uni, freq_rel_bi),
+                    decimals = 2)
+    )
+  ) %>%
+  opt_stylize(style = 6, color = "gray") %>%
+  opt_table_outline() %>%
+  tab_options(
+    table.align      = "left",
+    table.width      = px(1400),
+    data_row.padding = px(6)
+  )
+
+gt_geral_integrada
+
+# 10.0b) Distribuição de frequências — dispersão do corpus
+dist_freq_kw <- keywords_temas %>%
+  count(n, name = "n_termos") %>%
+  rename(frequencia = n) %>%
+  arrange(frequencia) %>%
+  mutate(
+    fonte           = "Palavras-chave",
+    pct_termos      = n_termos / sum(n_termos),
+    ocorrencias     = frequencia * n_termos,
+    pct_ocorrencias = ocorrencias / sum(ocorrencias)
+  )
+
+dist_freq_uni <- unigramas_temas %>%
+  count(n, name = "n_termos") %>%
+  rename(frequencia = n) %>%
+  arrange(frequencia) %>%
+  mutate(
+    fonte           = "Unigramas (títulos)",
+    pct_termos      = n_termos / sum(n_termos),
+    ocorrencias     = frequencia * n_termos,
+    pct_ocorrencias = ocorrencias / sum(ocorrencias)
+  )
+
+dist_freq_bi <- bigrams_freq %>%
+  count(n, name = "n_termos") %>%
+  rename(frequencia = n) %>%
+  arrange(frequencia) %>%
+  mutate(
+    fonte           = "Bigramas (títulos)",
+    pct_termos      = n_termos / sum(n_termos),
+    ocorrencias     = frequencia * n_termos,
+    pct_ocorrencias = ocorrencias / sum(ocorrencias)
+  )
+
+dist_freq_total <- bind_rows(dist_freq_kw, dist_freq_uni, dist_freq_bi)
+
+dist_freq_faixas <- dist_freq_total %>%
+  mutate(
+    faixa = case_when(
+      frequencia == 1                    ~ "1 (hapax)",
+      frequencia == 2                    ~ "2",
+      frequencia >= 3 & frequencia <= 5  ~ "3–5",
+      frequencia >= 6 & frequencia <= 10 ~ "6–10",
+      frequencia > 10                    ~ "> 10"
+    ),
+    faixa = factor(faixa, levels = c("1 (hapax)", "2", "3–5", "6–10", "> 10"))
+  ) %>%
+  group_by(fonte, faixa) %>%
+  summarise(
+    n_termos        = sum(n_termos),
+    ocorrencias     = sum(ocorrencias),
+    pct_termos      = sum(pct_termos),
+    pct_ocorrencias = sum(pct_ocorrencias),
+    .groups = "drop"
+  ) %>%
+  arrange(fonte, faixa)
+
+gt_dist_freq <- dist_freq_faixas %>%
+  gt(groupname_col = "fonte") %>%
+  fmt_percent(columns = c(pct_termos, pct_ocorrencias), decimals = 1) %>%
+  fmt_integer(columns = c(n_termos, ocorrencias)) %>%
+  cols_label(
+    faixa           = "Frequência",
+    n_termos        = "Nº de termos distintos",
+    pct_termos      = "% do vocabulário",
+    ocorrencias     = "Nº de ocorrências",
+    pct_ocorrencias = "% das ocorrências"
+  ) %>%
+  tab_header(
+    title    = "Distribuição de frequências por fonte",
+    subtitle = "Número de termos distintos e ocorrências por faixa de frequência"
+  ) %>%
+  opt_stylize(style = 6, color = "gray") %>%
+  opt_table_outline() %>%
+  tab_options(
+    table.align           = "left",
+    table.width           = px(800),
+    row_group.font.weight = "bold"
+  )
+
+gt_dist_freq
+
+gt_dist_freq_detalhada <- dist_freq_total %>%
+  select(fonte, frequencia, n_termos, pct_termos, ocorrencias, pct_ocorrencias) %>%
+  gt(groupname_col = "fonte") %>%
+  fmt_percent(columns = c(pct_termos, pct_ocorrencias), decimals = 2) %>%
+  fmt_integer(columns = c(frequencia, n_termos, ocorrencias)) %>%
+  cols_label(
+    frequencia      = "Frequência",
+    n_termos        = "Nº de termos distintos",
+    pct_termos      = "% do vocabulário",
+    ocorrencias     = "Nº de ocorrências",
+    pct_ocorrencias = "% das ocorrências"
+  ) %>%
+  opt_stylize(style = 6, color = "gray") %>%
+  opt_table_outline() %>%
+  tab_options(
+    table.align           = "left",
+    table.width           = px(800),
+    row_group.font.weight = "bold"
+  )
+
+gt_dist_freq_detalhada
+
+# 10.1) Autores nas palavras-chave — normalização
+keywords_autores_normalizados <- keywords_long %>%
+  filter(str_detect(keyword, "^[^,]+,\\s*[^,]+,\\s*\\d{3,4}")) %>%
+  mutate(autor_normalizado = sapply(keyword, normalizar_autor_keyword)) %>%
+  filter(
+    !str_detect(autor_normalizado,
+                "^(Brasil|America|Estados|Charlie|Partido|Igreja)"),
+    str_count(autor_normalizado, "\\S+") >= 2
+  ) %>%
+  select(doc_id, ano_de_defesa, periodo, autor_normalizado)
+
+keywords_autores_freq <- keywords_autores_normalizados %>%
+  count(autor_normalizado, sort = TRUE, name = "n")
+
+total_kw_geral <- sum(keywords_autores_freq$n)
+
+gt_keywords_autores <- criar_tabela_freq(
+  keywords_autores_freq %>% filter(n >= 2),
+  autor_normalizado, n_top = 50, termo_label = "Autor"
+)
+gt_keywords_autores
+
+# Palavras-chave temáticas por período
+tabela_keywords_decada <- bind_rows(
+  keywords_long %>%
+    filter(!str_detect(keyword, ",\\s*\\d{4}"), periodo == "1974–1983") %>%
+    count(periodo, keyword, sort = TRUE, name = "n"),
+  keywords_long %>%
+    filter(!str_detect(keyword, ",\\s*\\d{4}"), periodo != "1974–1983") %>%
+    count(periodo, keyword, sort = TRUE, name = "n")
+) %>%
+  mutate(item = sprintf("%s (%d)", str_to_sentence(keyword), n)) %>%
+  group_by(periodo) %>%
+  summarise(
+    `Palavras-chave (freq.)` = str_c(item, collapse = "; "),
+    .groups = "drop"
+  ) %>%
+  arrange(periodo)
+
+# Autores nas keywords por período
+tabela_autores_keywords_decada <- bind_rows(
+  keywords_autores_normalizados %>%
+    filter(periodo == "1974–1983") %>%
+    count(periodo, autor_normalizado, sort = TRUE, name = "n") %>%
+    filter(n >= 1),
+  keywords_autores_normalizados %>%
+    filter(periodo != "1974–1983") %>%
+    count(periodo, autor_normalizado, sort = TRUE, name = "n") %>%
+    filter(n >= 2)
+) %>%
+  mutate(item = sprintf("%s (%d)", autor_normalizado, n)) %>%
+  group_by(periodo) %>%
+  summarise(
+    `Autores — palavras-chave (freq.)` = str_c(item, collapse = "; "),
+    .groups = "drop"
+  ) %>%
+  arrange(periodo)
+
+# 10.2) Tabela comparada de autores (títulos + palavras-chave)
+total_titulo_geral <- sum(unigramas_autores$n)
+
+keywords_autores_freq_harm <- keywords_autores_freq %>%
+  mutate(autor_normalizado = harmonizar_nome(autor_normalizado)) %>%
+  group_by(autor_normalizado) %>%
+  summarise(n = sum(n), .groups = "drop") %>%
+  arrange(desc(n))
+
+unigramas_autores_harm <- unigramas_autores %>%
+  mutate(autor_normalizado = harmonizar_nome(formatar_token(palavra))) %>%
+  group_by(autor_normalizado) %>%
+  summarise(n = sum(n), .groups = "drop") %>%
+  arrange(desc(n))
+
+autores_comparados <- keywords_autores_freq_harm %>%
+  filter(n >= 2) %>%
+  rename(freq_kw = n) %>%
+  full_join(
+    unigramas_autores_harm %>%
+      filter(n >= 2) %>%
+      rename(freq_titulo = n),
+    by = "autor_normalizado"
+  ) %>%
+  arrange(desc(coalesce(freq_kw, 0L)), desc(coalesce(freq_titulo, 0L))) %>%
+  mutate(
+    rank         = row_number(),
+    freq_rel_kw  = freq_kw    / total_kw_geral,
+    freq_rel_tit = freq_titulo / total_titulo_geral,
+    fonte        = case_when(
+      !is.na(freq_kw) & !is.na(freq_titulo) ~ "Ambas",
+      !is.na(freq_kw)                        ~ "Só palavras-chave",
+      TRUE                                   ~ "Só títulos"
+    )
+  )
+
+gt_autores_comparados <- autores_comparados %>%
+  select(rank, autor_normalizado, freq_kw, freq_rel_kw,
+         freq_titulo, freq_rel_tit, fonte) %>%
+  gt() %>%
+  fmt_percent(columns = c(freq_rel_kw, freq_rel_tit), decimals = 2) %>%
+  sub_missing(missing_text = "—") %>%
+  cols_label(
+    rank              = "Posição",
+    autor_normalizado = "Autor",
+    freq_kw           = "Frequência",
+    freq_rel_kw       = "Freq. relativa",
+    freq_titulo       = "Frequência",
+    freq_rel_tit      = "Freq. relativa",
+    fonte             = "Fonte"
+  ) %>%
+  tab_spanner(
+    label   = "Palavras-chave",
+    columns = c(freq_kw, freq_rel_kw)
+  ) %>%
+  tab_spanner(
+    label   = "Títulos",
+    columns = c(freq_titulo, freq_rel_tit)
+  ) %>%
+  opt_stylize(style = 6, color = "gray") %>%
+  opt_table_outline() %>%
+  tab_options(table.align = "left", table.width = px(900))
+
+gt_autores_comparados
+
+# 11) Tabela integrada por período
+todos_periodos <- tibble(
+  periodo = c("1974–1983", "1984–1993", "1994–2003",
+              "2004–2013", "2014–2024")
+)
+
+tabela_integrada_decada <- todos_periodos %>%
+  left_join(tabela_unigramas_decada,        by = "periodo") %>%
+  left_join(tabela_bigrams_decada,          by = "periodo") %>%
+  left_join(tabela_autores_decada,          by = "periodo") %>%
+  left_join(tabela_keywords_decada,         by = "periodo") %>%
+  left_join(tabela_autores_keywords_decada, by = "periodo") %>%
+  mutate(across(where(is.character), ~replace_na(., "—"))) %>%
+  arrange(periodo)
+
+gt_integrada_decada <- tabela_integrada_decada %>%
+  gt() %>%
+  cols_width(
+    periodo                            ~ px(150),
+    `Unigramas (freq.)`                ~ px(700),
+    `Bigramas (freq.)`                 ~ px(700),
+    `Autores (freq.)`                  ~ px(500),
+    `Palavras-chave (freq.)`           ~ px(700),
+    `Autores — palavras-chave (freq.)` ~ px(500)
+  ) %>%
+  cols_label(
+    periodo                            = "Período",
+    `Unigramas (freq.)`                = "Unigramas",
+    `Bigramas (freq.)`                 = "Bigramas",
+    `Autores (freq.)`                  = "Autores",
+    `Palavras-chave (freq.)`           = "Palavras-chave",
+    `Autores — palavras-chave (freq.)` = "Autores"
+  ) %>%
+  tab_spanner(
+    label   = "Títulos",
+    columns = c(`Unigramas (freq.)`, `Bigramas (freq.)`, `Autores (freq.)`)
+  ) %>%
+  tab_spanner(
+    label   = "Palavras-chave",
+    columns = c(`Palavras-chave (freq.)`, `Autores — palavras-chave (freq.)`)
+  ) %>%
+  opt_stylize(style = 6, color = "gray") %>%
+  opt_table_outline() %>%
+  tab_options(
+    table.width      = px(3300),
+    table.align      = "left",
+    data_row.padding = px(6),
+    table.font.size  = px(12)
+  )
+
+gt_integrada_decada
+
+# 12) Exportações
+# gtsave(gt_unigramas_temas,    "unigramas_temas_top30.png",
+#        vwidth = 900,  vheight = 1200, zoom = 2)
+# gtsave(gt_unigramas_autores,  "unigramas_autores_top30.png",
+#        vwidth = 900,  vheight = 800,  zoom = 2)
+# gtsave(gt_bigrams,            "bigrams_top30.png",
+#        vwidth = 900,  vheight = 1200, zoom = 2)
+# gtsave(gt_keywords_temas,     "keywords_temas_top30.png",
+#        vwidth = 900,  vheight = 1200, zoom = 2)
+# gtsave(gt_keywords_autores,   "keywords_autores_top30.png",
+#        vwidth = 900,  vheight = 800,  zoom = 2)
+# gtsave(gt_autores_comparados, "autores_comparados.png",
+#        vwidth = 1100, vheight = 1200, zoom = 2)
+# gtsave(gt_geral_integrada,    "geral_integrada.png",
+#        vwidth = 1400, vheight = 1200, zoom = 2)
+# gtsave(gt_dist_freq,          "dist_freq_faixas.png",
+#        vwidth = 900,  vheight = 600,  zoom = 2)
+# gtsave(gt_dist_freq_detalhada, "dist_freq_detalhada.png",
+#        vwidth = 900,  vheight = 1200, zoom = 2)
+# gtsave(gt_integrada_decada,   "integrada_decada.png",
+#        vwidth = 3300, vheight = 4500, zoom = 1)
