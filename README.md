@@ -1,6 +1,6 @@
 # 50 Anos do Programa de Pós-Graduação em Sociologia da Unicamp: Análise das Dissertações de Mestrado
 ## Sobre este repositório
-Este repositório contém os códigos de análise desenvolvidos no âmbito de iniciação científica e capítulo de livro vinculados ao projeto 50 Anos do PPGS-Unicamp, dedicado à recuperação e análise da produção científica e trajetória institucional do Programa de Pós-Graduação em Sociologia da Unicamp.
+Este repositório contém os códigos de análise desenvolvidos por Diego Zoppi Pereira de Lima no âmbito de iniciação científica e capítulo de livro vinculados ao projeto 50 Anos do PPGS-Unicamp, orientado pelo prof. Leonardo de Oliveira Fontes (Universidade Estadual de Campinas), dedicado à recuperação e análise da produção científica e trajetória institucional do Programa de Pós-Graduação em Sociologia da Unicamp.
 Os scripts cobrem as etapas de limpeza e padronização de metadados bibliográficos, análises bibliométricas e cientométricas (títulos, palavras-chave, orientadores, avaliadores) e construção de redes de coocorrência temática e colaboração acadêmica.
 ## Dados
 Disponíveis no Dataverse da Unicamp → doi:10.25824/redu/7BDBVD.
